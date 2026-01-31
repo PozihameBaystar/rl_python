@@ -202,7 +202,7 @@ class DDPGAgent:
             y_targets = rewards + self.Config.gamma*(1-dones)*self.Q_target_net(torch.cat([states_next, actions_next_for_target], dim=1))
         
         Q_values = self.Q_net(torch.cat([states,actions],dim=1))
-        Q_loss = F.mse_loss(y_targets,Q_values)
+        Q_loss = F.smooth_l1_loss(Q_values, y_targets)
         self.Q_optim.zero_grad()
         Q_loss.backward()
         self.Q_optim.step()
@@ -288,6 +288,13 @@ class TD3Agent:
         self.Q_optim2 = optim.Adam(self.Q_net2.parameters(), lr=Config.Q_lr2)
         self.P_optim = optim.Adam(self.P_net.parameters(), lr=Config.P_lr)
 
+        # Actorの学習頻度を設定するための変数（これを特定の数で割った余りが0の時だけactor更新にする）
+        self.actor_update_counter = 0
+        self.policy_update_freq = 2  # TD3の論文では2に設定されていることが多い
+
+        # TDターゲットの計算の際に使用するノイズのクリッピング範囲
+        self.target_policy_noise_clip = 0.5  # TD3論文では0.5に設定されていることが多い
+
     def to(self, device):
         """エージェントの内部のネットと必要Tensorを全部指定 device に移す"""
         self.device = torch.device(device)
@@ -334,7 +341,7 @@ class TD3Agent:
         action = self.P_net(obs)  # shape: (1, act_dim)
 
         # ε ~ N(0, σ^2 I) を生成して加算（探索ノイズを加える）
-        eps = float(self.Config.sig) * torch.rand_like(action)
+        eps = float(self.Config.sig) * torch.randn_like(action)
         action = action + eps
 
         # 出力製薬 [u_low, u_high] 以内に収める
@@ -433,6 +440,11 @@ class TD3Agent:
         
         with torch.no_grad():
             actions_next_for_target = self.P_target_net(states_next)
+            actions_next_for_target += torch.clamp(
+                torch.randn_like(actions_next_for_target) * self.Config.sig,
+                -self.target_policy_noise_clip,
+                self.target_policy_noise_clip,
+            )
             Q_target1 = self.Q_target_net1(torch.cat([states_next,actions_next_for_target],dim=1))
             Q_target2 = self.Q_target_net2(torch.cat([states_next,actions_next_for_target],dim=1))
             y_targets = rewards + self.Config.gamma*(1-dones)*torch.min(Q_target1,Q_target2)
@@ -449,35 +461,41 @@ class TD3Agent:
         self.Q_optim2.step()
 
         # ---- Actor update ----
-        # Actor 更新では Q_net を通すが、Q_net自体は更新しないので凍結1
-        for p in self.Q_net1.parameters():
-            p.requires_grad_(False)
+        # Actor 更新は一定頻度でのみ行う
+        if self.actor_update_counter % self.policy_update_freq == 0:
+            # Actor 更新では Q_net を通すが、Q_net自体は更新しないので凍結
+            for p in self.Q_net1.parameters():
+                p.requires_grad_(False)
 
-        actions_for_Ploss = self.P_net(states)
-        P_loss = -self.Q_net1(torch.cat([states,actions_for_Ploss],dim=1)).mean()
-        self.P_optim.zero_grad()
-        P_loss.backward()
-        self.P_optim.step()
+            actions_for_Ploss = self.P_net(states)
+            P_loss = -self.Q_net1(torch.cat([states,actions_for_Ploss],dim=1)).mean()
+            self.P_optim.zero_grad()
+            P_loss.backward()
+            self.P_optim.step()
 
-        for p in self.Q_net1.parameters():
-            p.requires_grad_(True)
+            for p in self.Q_net1.parameters():
+                p.requires_grad_(True)
 
-        # ---- Target net update ----
-        self.soft_update(
-            target_net=self.Q_target_net1,
-            online_net=self.Q_net1,
-            tau=self.Config.tau,
-        )
-        self.soft_update(
-            target_net=self.Q_target_net2,
-            online_net=self.Q_net2,
-            tau=self.Config.tau,
-        )
-        self.soft_update(
-            target_net=self.P_target_net,
-            online_net=self.P_net,
-            tau=self.Config.tau
-        )
+            # ---- Target net update ----
+            self.soft_update(
+                target_net=self.Q_target_net1,
+                online_net=self.Q_net1,
+                tau=self.Config.tau,
+            )
+            self.soft_update(
+                target_net=self.Q_target_net2,
+                online_net=self.Q_net2,
+                tau=self.Config.tau,
+            )
+            self.soft_update(
+                target_net=self.P_target_net,
+                online_net=self.P_net,
+                tau=self.Config.tau
+            )
+        else:
+            P_loss = torch.tensor(0.0)  # Actor更新しなかった場合は0を返すようにしておく
+
+        self.actor_update_counter += 1
 
         return float(Q_loss1.item()), float(Q_loss2.item()), float(P_loss.item())
     
