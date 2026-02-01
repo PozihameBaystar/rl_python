@@ -2,6 +2,7 @@ import copy
 from dataclasses import dataclass, asdict, is_dataclass, field
 
 import numpy as np
+import logging
 
 import torch
 import torch.nn as nn
@@ -498,7 +499,7 @@ class TD3Agent:
         self.actor_update_counter += 1
 
         return float(Q_loss1.item()), float(Q_loss2.item()), float(P_loss.item())
-    
+
 
 
 # TRPOエージェント
@@ -851,6 +852,286 @@ class TRPOAgent:
         cfg = asdict(self.Config) if is_dataclass(self.Config) else self.Config
         save_dict = {
             "Config": cfg,
+            "V_net_state_dict": self.V_net.state_dict(),
+            "P_net_state_dict": self.P_net.state_dict(),
+            "log_std": self.log_std.data,
+        }
+        if extra is not None:
+            save_dict.update(extra)
+        torch.save(save_dict, path)
+        
+    def load_all(self, path: str, map_location=None):
+        load_dict = torch.load(path, map_location=map_location)
+        self.V_net.load_state_dict(load_dict["V_net_state_dict"])
+        self.P_net.load_state_dict(load_dict["P_net_state_dict"])
+        self.log_std.data = load_dict["log_std"].to(self.device)
+
+
+
+# PPOエージェント
+class PPOAgent:
+    def __init__(self, Config, device=None):
+        if Config is None:
+            raise ValueError("No Config!!")
+        self.Config = Config
+
+        # device
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        self.u_low = torch.tensor(Config.u_llim, dtype=torch.float32, device=self.device)
+        self.u_high = torch.tensor(Config.u_ulim, dtype=torch.float32, device=self.device)
+
+        # networks
+        self.V_net = self.build_net(Config.V_net_in, Config.V_net_sizes, Config.V_net_out).to(self.device)
+        self.P_net = self.build_net(Config.P_net_in, Config.P_net_sizes, Config.P_net_out).to(self.device)
+
+        self.V_net.train()
+        self.P_net.train()
+
+        # log_std は状態に依存しないパラメータ
+        action_dim = Config.P_net_out
+        self.log_std = nn.Parameter(torch.zeros(action_dim, device=self.device))
+
+        # optimizer（baselineはAdam）
+        self.V_optim = optim.Adam(self.V_net.parameters(), lr=Config.V_lr)
+        self.P_optim = optim.Adam(
+            list(self.P_net.parameters()) + [self.log_std], 
+            lr=Config.P_lr
+        )
+
+        # hyperparams
+        self.gamma = float(Config.gamma)
+        self.tau = float(Config.lam)  # baselineの TAU (= GAE lambda)
+        self.target_kl = float(getattr(Config, "target_kl", 0.01))
+        self.reward_scaling = float(getattr(Config, "reward_scaling", 0.01))
+
+        self.policy_train_iters = int(getattr(Config, "policy_train_iters", 80))
+        self.value_train_iters = int(getattr(Config, "value_train_iters", 5))
+        self.value_l2_reg = float(getattr(Config, "value_l2_reg", 1e-3))
+        self.v_clip_epsilon = float(getattr(Config, "v_clip_epsilon", 0.2))
+
+    def build_net(self, input_size, hidden_sizes, output_size):
+        layers = []
+        in_size = input_size
+        for h_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, h_size))
+            layers.append(nn.ReLU())
+            in_size = h_size
+        layers.append(nn.Linear(in_size, output_size))
+        net = nn.Sequential(*layers)
+        return net
+    
+    @torch.no_grad()
+    def get_action_and_log_prob(self, state, deterministic=False):
+        """
+        deterministic: Trueなら平均値(mean)を返す。Falseならサンプリング。
+        """
+        s = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        if s.dim() == 1:
+            s = s.unsqueeze(0)  # (1, obs_dim)
+
+        dist = self._policy_dist(s)  # Normal(mean, std)
+
+        if deterministic:
+            a = dist.mean  # (1, act_dim)
+            logp = None
+        else:
+            a = dist.sample()
+            logp = dist.log_prob(a).sum(axis=-1)  # (1,)
+
+        # 返すactionはclip前
+        # envに入れるときにnp.clipする
+        a = a.squeeze(0)
+        if logp is not None:
+            logp = logp.squeeze(0)
+        return a, logp
+    
+    @torch.no_grad()
+    def step(self, state):
+        """
+        推論時に使う用のwrapper関数
+        """
+        a, _ = self.get_action_and_log_prob(state, deterministic=True)
+        return a.cpu().numpy()
+    
+    def _policy_mean(self, states):
+        """
+        方策ネットから行動平均を計算するラッパー関数
+        states: (batch_size, obs_dim)
+        return: (batch_size, act_dim)
+        """
+        mean = self.P_net(states)  # (batch_size, act_dim)
+        return mean
+    
+    def _policy_dist(self, states):
+        """
+        方策ネットから平均を計算し、パラメータから分散を計算して、正規分布を返すラッパー関数
+        states: (batch_size, obs_dim)
+        return: Normal distribution
+        """
+        mean = self._policy_mean(states)  # (batch_size, act_dim)
+        std = torch.exp(self.log_std)  # (act_dim,)
+        std = std.unsqueeze(0).expand_as(mean)  # (batch_size, act_dim)
+        dist = Normal(mean, std)
+        return dist
+    
+    @torch.no_grad()
+    def _compute_gae(self, rewards, values, next_values, dones):
+        """
+        GAEを計算する関数
+        rewards: (batch_size,)
+        values: (batch_size,)
+        next_values: (batch_size,)
+        dones: (batch_size,)
+        return: advantages: (batch_size,), returns: (batch_size,)
+        """
+        batch_size = rewards.shape[0]
+        adv = torch.zeros_like(rewards, device=self.device)
+        gae = 0.0
+
+        for t in reversed(range(batch_size)):
+            if t == batch_size - 1:
+                nv = next_values[t]
+            else:
+                nv = values[t + 1]
+            delta = rewards[t] + self.gamma * nv * (1 - dones[t]) - values[t]
+            gae = delta + self.gamma * self.tau * (1 - dones[t]) * gae
+            adv[t] = gae
+
+        ret = adv + values
+        return adv, ret
+    
+    def _ppo_step(self, states, actions, old_log_probs, advantages):
+        """
+        PPOの方策ネット更新を行う関数
+        states: (batch_size, obs_dim)
+        actions: (batch_size, act_dim)
+        old_log_probs: (batch_size,)
+        advantages: (batch_size,)
+        return: policy_loss
+        """
+
+        for _ in range(self.policy_train_iters):
+            dist = self._policy_dist(states)  # Normal(mean, std)
+            log_probs = dist.log_prob(actions).sum(axis=-1)  # (batch_size,)
+
+            ratios = torch.exp(log_probs - old_log_probs)  # (batch_size,)
+
+            surr1 = ratios * advantages  # (batch_size,)
+            surr2 = torch.clamp(ratios, 1.0 - self.Config.clip_ratio, 1.0 + self.Config.clip_ratio) * advantages  # (batch_size,)
+
+            policy_loss = -torch.min(surr1, surr2).mean()
+            self.P_optim.zero_grad()
+            policy_loss.backward()
+            self.P_optim.step()
+
+        # どれくらい変化したかを確認する
+        change = (old_log_probs - log_probs).mean()
+
+        return policy_loss, change
+    
+    def _update_value_function(self, states, returns, old_values):
+        """
+        価値関数ネットワークの更新を行う関数
+        states: (batch_size, obs_dim)
+        returns: (batch_size,)
+        return: value_loss
+        """
+        for _ in range(self.value_train_iters):
+            values = self.V_net(states).squeeze(-1)  # (batch_size,)
+            value_loss = F.mse_loss(values, returns)
+
+            # クリッピング版の価値関数損失（Vの計算が暴走するのを防ぐため）
+            v_clip = old_values + torch.clamp(values - old_values, self.v_clip_epsilon, self.v_clip_epsilon)
+            v_clip_loss = F.mse_loss(v_clip, returns)
+
+            # L2正則化
+            l2_reg = torch.tensor(0., device=self.device)
+            for param in self.V_net.parameters():
+                l2_reg += torch.norm(param)**2
+            loss = torch.max(value_loss, v_clip_loss) + self.value_l2_reg * l2_reg
+            # loss = value_loss + self.value_l2_reg * l2_reg
+
+            self.V_optim.zero_grad()
+            loss.backward()
+            self.V_optim.step()
+
+        return loss
+    
+    def update_net(self, states, actions, log_probs, rewards, next_states, dones):
+        """
+        ネットワークを更新する関数
+        states: (batch_size, obs_dim)
+        actions: (batch_size, act_dim)
+        log_probs: (batch_size,)
+        rewards: (batch_size,)
+        next_states: (batch_size, obs_dim)
+        dones: (batch_size,)
+        return: dict of losses
+        """
+        states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
+        log_probs = torch.as_tensor(log_probs, dtype=torch.float32, device=self.device)
+        rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
+        dones = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
+
+        # 一応shapeを揃えておく
+        actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device).view(-1, self.Config.act_dim)
+
+        # old_log_probs も念のためshapeをそろえてdetachしておく
+        old_log_probs = torch.as_tensor(log_probs, dtype=torch.float32, device=self.device).view(-1).detach()
+
+        # GAEの計算
+        with torch.no_grad():
+            values = self.V_net(states).squeeze(-1)  # (batch_size,)
+            next_values = self.V_net(next_states).squeeze(-1)  # (batch_size,)
+
+            advantages, returns = self._compute_gae(rewards, values, next_values, dones)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # 正規化
+
+        # 方策ネットワークの更新
+        policy_loss, kl_change = self._ppo_step(states, actions, old_log_probs, advantages)
+
+        # 変化量に応じて学習率を調整
+        if kl_change > 1.5 * self.target_kl:
+            for param_group in self.P_optim.param_groups:
+                param_group['lr'] = max(param_group['lr'] / 1.5, 1e-5)
+                logging.info(f"Decreased policy learning rate to {param_group['lr']}")
+        elif kl_change < self.target_kl / 1.5:
+            for param_group in self.P_optim.param_groups:
+                param_group['lr'] = min(param_group['lr'] * 1.5, 1e-2)
+                logging.info(f"Increased policy learning rate to {param_group['lr']}")
+
+        # 価値観数ネットワークの更新
+        value_loss = self._update_value_function(states, returns, values)
+
+        return {"policy_loss": policy_loss.item(), "value_loss": value_loss.item()}
+    
+    def to(self, device):
+        self.device = torch.device(device)
+        self.V_net.to(self.device)
+        self.P_net.to(self.device)
+        self.log_std.data = self.log_std.data.to(self.device)
+        self.u_low = self.u_low.to(self.device)
+        self.u_high = self.u_high.to(self.device)
+        return self
+
+    def mode2eval(self):
+        self.V_net.eval()
+        self.P_net.eval()
+
+    def mode2train(self):
+        self.V_net.train()
+        self.P_net.train()
+
+    def save_all(self, path: str, extra: dict | None = None):
+        cfg = asdict(self.Config) if is_dataclass(self.Config) else self.Config
+        save_dict = {
+            "config": cfg,
             "V_net_state_dict": self.V_net.state_dict(),
             "P_net_state_dict": self.P_net.state_dict(),
             "log_std": self.log_std.data,
