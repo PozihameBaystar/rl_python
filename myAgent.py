@@ -928,6 +928,7 @@ class PPOAgent:
     def get_action_and_log_prob(self, state, deterministic=False):
         """
         deterministic: Trueなら平均値(mean)を返す。Falseならサンプリング。
+        並列学習に対応できる様に余分なsqueezeを削除（返す値が一つしかない場合のみ次元を削るように変更）
         """
         s = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if s.dim() == 1:
@@ -936,17 +937,18 @@ class PPOAgent:
         dist = self._policy_dist(s)  # Normal(mean, std)
 
         if deterministic:
-            a = dist.mean  # (1, act_dim)
+            a = dist.mean  # (1, act_dim) or (N, act_dim)
             logp = None
         else:
             a = dist.sample()
-            logp = dist.log_prob(a).sum(axis=-1)  # (1,)
+            logp = dist.log_prob(a).sum(axis=-1)  # (1,) or (N,)
 
         # 返すactionはclip前
         # envに入れるときにnp.clipする
-        a = a.squeeze(0)
-        if logp is not None:
-            logp = logp.squeeze(0)
+        if a.shape[0] == 1:
+            a = a.squeeze(0)
+            if logp is not None:
+                logp = logp.squeeze(0)
         return a, logp
     
     @torch.no_grad()
@@ -972,9 +974,10 @@ class PPOAgent:
         states: (batch_size, obs_dim)
         return: Normal distribution
         """
-        mean = self._policy_mean(states)  # (batch_size, act_dim)
+        mean = self._policy_mean(states)  # (batch_size, act_dim) or (batch_size, N, act_dim)
         std = torch.exp(self.log_std)  # (act_dim,)
-        std = std.unsqueeze(0).expand_as(mean)  # (batch_size, act_dim)
+        # std = std.unsqueeze(0).expand_as(mean)  # (batch_size, act_dim) or (batch_size, N, act_dim)
+        # stdを拡張しなくてもNormal内部で自動でbroadcastされるので問題ないはず
         dist = Normal(mean, std)
         return dist
     
@@ -982,15 +985,19 @@ class PPOAgent:
     def _compute_gae(self, rewards, values, next_values, dones):
         """
         GAEを計算する関数
-        rewards: (batch_size,)
-        values: (batch_size,)
-        next_values: (batch_size,)
-        dones: (batch_size,)
-        return: advantages: (batch_size,), returns: (batch_size,)
+        並列環境計算にも対応させる
+        rewards: (batch_size,) or (batch_size, N)
+        values: (batch_size,) or (batch_size, N)
+        next_values: (batch_size,) or (batch_size, N)
+        dones: (batch_size,) or (batch_size, N)
+        return: advantages: (batch_size,) or (batch_size, N), returns: (batch_size,) or (batch_size, N)
         """
         batch_size = rewards.shape[0]
         adv = torch.zeros_like(rewards, device=self.device)
-        gae = 0.0
+        if rewards.dim() == 1:
+            gae = 0.0
+        elif rewards.dim() == 2:
+            gae = torch.zeros(rewards.shape[1], device=self.device)
 
         for t in reversed(range(batch_size)):
             if t == batch_size - 1:
@@ -1007,21 +1014,21 @@ class PPOAgent:
     def _ppo_step(self, states, actions, old_log_probs, advantages):
         """
         PPOの方策ネット更新を行う関数
-        states: (batch_size, obs_dim)
-        actions: (batch_size, act_dim)
-        old_log_probs: (batch_size,)
-        advantages: (batch_size,)
+        states: (batch_size, obs_dim) or (batch_size, N, obs_dim)
+        actions: (batch_size, act_dim) or (batch_size, N, act_dim)
+        old_log_probs: (batch_size,) or (batch_size, N)
+        advantages: (batch_size,)  or (batch_size, N)
         return: policy_loss
         """
 
         for _ in range(self.policy_train_iters):
             dist = self._policy_dist(states)  # Normal(mean, std)
-            log_probs = dist.log_prob(actions).sum(axis=-1)  # (batch_size,)
+            log_probs = dist.log_prob(actions).sum(axis=-1)  # (batch_size,) or (batch_size, N)
 
-            ratios = torch.exp(log_probs - old_log_probs)  # (batch_size,)
+            ratios = torch.exp(log_probs - old_log_probs)  # (batch_size,) or (batch_size, N)
 
-            surr1 = ratios * advantages  # (batch_size,)
-            surr2 = torch.clamp(ratios, 1.0 - self.Config.clip_ratio, 1.0 + self.Config.clip_ratio) * advantages  # (batch_size,)
+            surr1 = ratios * advantages  # (batch_size,) or (batch_size, N)
+            surr2 = torch.clamp(ratios, 1.0 - self.Config.clip_ratio, 1.0 + self.Config.clip_ratio) * advantages  # (batch_size,) or (batch_size, N)
 
             policy_loss = -torch.min(surr1, surr2).mean()
             self.P_optim.zero_grad()
@@ -1036,16 +1043,16 @@ class PPOAgent:
     def _update_value_function(self, states, returns, old_values):
         """
         価値関数ネットワークの更新を行う関数
-        states: (batch_size, obs_dim)
-        returns: (batch_size,)
+        states: (batch_size, obs_dim) or (batch_size, N, obs_dim)
+        returns: (batch_size,) or (batch_size, N)
         return: value_loss
         """
         for _ in range(self.value_train_iters):
-            values = self.V_net(states).squeeze(-1)  # (batch_size,)
+            values = self.V_net(states).squeeze(-1)  # (batch_size,) or (batch_size, N)
             value_loss = F.mse_loss(values, returns)
 
             # クリッピング版の価値関数損失（Vの計算が暴走するのを防ぐため）
-            v_clip = old_values + torch.clamp(values - old_values, self.v_clip_epsilon, self.v_clip_epsilon)
+            v_clip = old_values + torch.clamp(values - old_values, -self.v_clip_epsilon, self.v_clip_epsilon)
             v_clip_loss = F.mse_loss(v_clip, returns)
 
             # L2正則化
@@ -1074,21 +1081,15 @@ class PPOAgent:
         """
         states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
         actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-        log_probs = torch.as_tensor(log_probs, dtype=torch.float32, device=self.device)
+        old_log_probs = torch.as_tensor(log_probs, dtype=torch.float32, device=self.device)
         rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         next_states = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
         dones = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
 
-        # 一応shapeを揃えておく
-        actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device).view(-1, self.Config.act_dim)
-
-        # old_log_probs も念のためshapeをそろえてdetachしておく
-        old_log_probs = torch.as_tensor(log_probs, dtype=torch.float32, device=self.device).view(-1).detach()
-
         # GAEの計算
         with torch.no_grad():
-            values = self.V_net(states).squeeze(-1)  # (batch_size,)
-            next_values = self.V_net(next_states).squeeze(-1)  # (batch_size,)
+            values = self.V_net(states).squeeze(-1)  # (batch_size,) or (batch_size, N)
+            next_values = self.V_net(next_states).squeeze(-1)  # (batch_size,) or (batch_size, N)
 
             advantages, returns = self._compute_gae(rewards, values, next_values, dones)
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # 正規化
@@ -1140,8 +1141,8 @@ class PPOAgent:
             save_dict.update(extra)
         torch.save(save_dict, path)
         
-    def load_all(self, path: str, map_location=None):
-        load_dict = torch.load(path, map_location=map_location)
+    def load_all(self, path: str, map_location=None, weights_only=False):
+        load_dict = torch.load(path, map_location=map_location, weights_only=weights_only)
         self.V_net.load_state_dict(load_dict["V_net_state_dict"])
         self.P_net.load_state_dict(load_dict["P_net_state_dict"])
         self.log_std.data = load_dict["log_std"].to(self.device)

@@ -2,4 +2,4 @@ __pycache__/
 models/
 sample_AC.py
 sample_TRPO.ipynb
-myPPO_sample.py
+pararell_PPO_sample.ipynb
